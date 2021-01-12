@@ -1,0 +1,642 @@
+---
+title: "Ensemble method with Lending Club data "
+author: "Sumin Lee"
+date: "`r Sys.Date()`"
+output:
+    html_document:
+      number_sections: true
+      highlight: haddock
+      theme: spacelab
+      toc: yes
+      toc_depth: 2
+      toc_float:
+        collapsed: false
+    
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r, load_libraries, include = FALSE}
+
+if(!is.element("tidyverse", installed.packages()[,1]))
+{  install.packages("tidyverse")}
+
+if(!is.element("Hmisc", installed.packages()[,1]))
+{  install.packages("Hmisc")} #package for data summary using `describe`
+
+if(!is.element("ggplot2", installed.packages()[,1]))
+{  install.packages("ggplot2")} #package for plots
+if(!is.element("ggthemes", installed.packages()[,1]))
+{  install.packages("ggthemes")} #package to make fancier ggplots
+if(!is.element("caret", installed.packages()[,1]))
+{  install.packages("caret",dependencies=T)} #package to train machine learning algorithms
+if(!is.element("Metrics", installed.packages()[,1]))
+{ install.packages("Metrics")}  #package to check the performance of machine learning algorithms
+if(!is.element("factoextra", installed.packages()[,1]))
+{ install.packages("factoextra")} #package to visualize results of machine learning tools
+if(!is.element("rpart", installed.packages()[,1]))
+{ install.packages("rpart")} #package to visualize results of machine learning tools
+if(!is.element("rpart.plot", installed.packages()[,1]))
+{ install.packages("rpart.plot")} #package to visualize results of machine learning tools
+if(!is.element("rsample", installed.packages()[,1]))
+{ install.packages("rsample")} #package to visualize results of machine learning tools
+if(!is.element("janitor", installed.packages()[,1]))
+{ install.packages("janitor")} #package to visualize results of machine learning tools
+if(!is.element("pROC", installed.packages()[,1]))
+{ install.packages("pROC")} #package to visualize results of machine learning tools
+
+if(!is.element("caretEnsemble", installed.packages()[,1]))
+{ install.packages("caretEnsemble")} #package to visualize results of machine learning tools
+
+library(caretEnsemble)
+library(tidyverse) # the usual stuff: dplyr, readr, and other goodies
+library(rpart)
+library(rpart.plot)
+library(lubridate)
+library(rsample) # to split dataframe in training- & testing sets
+library(janitor) # clean_names()
+library(caret) # to train more advanced models (k-fold cross-validation)
+library(pROC) # to plot ROC curves
+
+```
+
+
+# Introduction
+
+The purpose of this project is to check the performance of the machine learning algorithms and ensemble methods in predicting defaults in the lending club data. 
+
+## Load the data
+
+First we need to start by loading the data. 
+```{r, load_data, warning=FALSE, message=FALSE}
+lc_raw <- read_csv("LendingClub Data.csv",  skip=1) %>%  #since the first row is a title we want to skip it. 
+  clean_names() # use janitor::clean_names()
+```
+
+
+## Clean and process data
+
+The variable "loan_status" contains information as to whether the loan has been repaid or charged off (i.e., defaulted). Let's create a binary factor variable for this. This variable will be the focus of this project.
+
+```{r, clean data}
+#let's clean the data
+lc_clean <- lc_raw %>%
+  dplyr::select(-x20:-x80) %>% #delete empty columns
+  filter(!is.na(int_rate)) %>%   #delete empty rows
+  mutate(
+    issue_d = mdy(issue_d),  # lubridate::mdy() to fix date format
+    term = factor(term_months),     # turn 'term' into a categorical variable
+    delinq_2yrs = factor(delinq_2yrs) # turn 'delinq_2yrs' into a categorical variable
+  ) %>% 
+  mutate(default = dplyr::recode(loan_status, 
+                      "Charged Off" = "1", 
+                      "Fully Paid" = "0"))%>%
+    mutate(default = as.factor(default)) %>%
+  dplyr::select(-emp_title,-installment, -term_months, everything()) #move some not-so-important variables to the end. 
+    
+    glimpse(lc_clean)
+    
+```
+
+Reducing the category in some of the variables for simplicity.
+
+```{r}
+#Examine the final data frame
+
+#Choose a subset of variables for classification
+data_subset<-lc_clean%>%select(-c(issue_d,zip_code,addr_state,desc,purpose,title,installment,emp_title,term_months,loan_status))
+ glimpse(data_subset)
+
+#Reduce the categories for delinquincies. Check the results of the following code
+data_subset<-data_subset%>%mutate(delinq_2yrs=ifelse(as.character(delinq_2yrs) %in% c("0","1","2"),as.character(delinq_2yrs),3))
+data_subset$delinq_2yrs<-factor(data_subset$delinq_2yrs,labels=c("0","1","2","3"))
+
+
+#Reduce the categories for employment length
+data_subset<-data_subset%>%mutate(emp_length=ifelse(as.character(emp_length) %in% c("< 1 year","1 year","2 years","3 years","4 years","n/a"),as.character(emp_length),"More_than_5"))
+
+
+#Make sure emp_length is a factor
+data_subset$emp_length<-factor(data_subset$emp_length,labels=c("less_than1","1_year","2_years","3_years","4_years","More_than_5","No_Info"))
+table(data_subset$emp_length)
+
+#Make sure default is a factor
+levels(data_subset$default) <- make.names(levels(factor(data_subset$default)))
+data_subset$default <- factor(data_subset$default, labels = c("No", "Yes"))
+#Make sure grade and home_ownership are factors 
+data_subset$grade<-factor(data_subset$grade)
+
+
+#Reduce the categories for home_ownership 
+data_subset<-data_subset%>%mutate(home_ownership=ifelse(as.character(home_ownership) %in% c("MORTGAGE","OWN","RENT"),as.character(home_ownership),"OTHER"))
+data_subset$home_ownership<-factor(data_subset$home_ownership)
+table(data_subset$home_ownership)
+
+
+#Reduce the categories for verification_status 
+data_subset$verification_status <- factor(data_subset$verification_status)
+nv<-levels(data_subset$verification_status)[2]
+data_subset<-data_subset%>%mutate(verification_status=ifelse(as.character(verification_status)=="Source Verified","Verified",as.character(verification_status)))
+data_subset<-data_subset%>%mutate(verification_status=ifelse(as.character(verification_status)==nv,"Not_Verified",as.character(verification_status)))
+data_subset<-data_subset%>%mutate(verification_status=ifelse(as.character(verification_status)=="0","No_Info",as.character(verification_status)))
+data_subset$verification_status <- factor(data_subset$verification_status)
+table(data_subset$verification_status)
+
+
+#Check the results 
+head(data_subset)
+
+```
+
+Generate training and test data sets.
+
+```{r}
+library(rsample)
+set.seed(100) 
+train_test_split <- initial_split(data_subset, prop = 0.75) #training set contains 75% of the data
+train <- training(train_test_split)
+test <- testing(train_test_split)
+combined_train<-train
+combined_test<-test
+head(combined_train)
+```
+
+# Logistic regression 
+
+When we plot both of in-sample and out-of-sample prediction ROC curve, we can see that AUC(Area under the curve) for training dataset is 68.46% and AUC for testing dataset is 68.11%. Therefore, we can see that for out-of-sample prediction, the accuracy decreases. To improve this out-of-sample prediction performance, we conduct out-of-sample validation and three-way data partitioning. Three-way data partitioning is composed of 3 levels; training, validation, testing. Three-way data partitioning has a problem that it divides the dataset into 3 section and thus can utilise less amount of data to estimate the model. However, this problem can be overcome by using K-fold cross validation.
+
+The sum of estimated coefficients. This regularization improves the out-of-sample prediction performance because it choose 'lambda' to maximise the performance of out-of-sample through K-fold cross validation.
+
+```{r, multiple logistic regression}
+#I will use caret to fit a logistic regression model 
+train_control <- trainControl(method="cv", number=2, classProbs=TRUE, #cv = cross validation / number is the number of folds in the cross validation (I fit the model in one of them and use the other to check them and change the roles after that) / as the number increases the speed decreases.
+                        summaryFunction=twoClassSummary,verboseIter = TRUE)
+
+#Fit a logistic regression model
+logistic2<- train(default~., data = combined_train, preProcess = c("center", "scale"), 
+                 method="glm", family="binomial", metric="ROC", trControl=train_control)#glm = logistic regression
+#Check the results of the train function
+logistic2$results
+#Check the results of the train function: similar to the previous line
+print(logistic2)
+#Examine the results
+summary(logistic2)
+```
+Predict the probabilities for the test data.
+
+```{r}
+# Next I predict the probabilities and then plot the ROC curve. 
+watched_prob <- predict(logistic2, combined_test, type = "prob")[,2]
+watched_prob2 <- predict(logistic2, combined_train, type = "prob")[,2]#why 2? cuz we're gonna look at the probability of the default ones
+
+
+library(pROC)
+ROC_tr <- roc(combined_train$default, watched_prob2)
+ROC_lr <- roc(combined_test$default, watched_prob)
+# Calculate the area under the curve (AUC)
+AUC_lr <- round(auc(ROC_lr)*100, digits=2)
+AUC_tr <- round(auc(ROC_tr)*100, digits=2)
+# Plot the ROC curves
+plot(ROC_lr, col = "blue",main=paste("LogReg Lending-Out of Sample Data AUC=",AUC_lr,"%",sep = ""))
+plot(ROC_tr, col = "blue",main=paste("LogReg Leding-Training Data AUC=",AUC_tr,"%",sep = ""))
+
+
+```
+
+
+Plot the estimated probabilities for default and non-defaults
+```{r,  }
+ggplot( combined_test, aes( watched_prob, color = as.factor(default) ) ) +
+ geom_density( size = 1 ) +
+ ggtitle( "Test Data Set's Predicted Score_pdf" ) +
+ xlab("Estimated Probability")
+
+ggplot( combined_test, aes( watched_prob, color = as.factor(default) ) ) +
+ stat_ecdf( size = 1 ) +
+ ggtitle( "Test Data Set's Predicted Score_cdf" ) +
+ xlab("Estimated Probability")
+
+#cdf: 75% of them is below probability 0.2 
+#For who are default, when the probability of default is 0.2, the y is around 0.625
+
+#pdf: basically a histogram - the probability of being default is shown as a count (density)
+```
+
+Basically, when the ROC is very high, there is a neat separation between the two lines representing yes and no in the cdf, on the other hand when ROC is equal to 50% (random model) no such distinction is visible. In other words, when the two CDF lines are closer, the ROC curve becomes closer to the neutral line since it means that there are not much differences between two outcomes from logistic regression. 
+
+Additionally, Cumulative Distribution Function(CDF) plot shows the cumulative distribution of estimated probability for prediction of default. We are able to see that for the prediction of not being default achieves value 1 of ‘y’ more left than prediction for default. On the other hand, the Receiver and Operating Characteristic(ROC) curve is a scatterplot of the model’s sensitivity (True Positive rate) against the specificity (True Negative rate) for different cutoff values.
+
+# Fit a K-NN model - K's number of neighbors 
+Fit a K-NN model and choose k that gives the best AUC performance.
+
+i) I chose k = 5 by using k-fold cross validation here. In the "trControl" option we used the cross validation model we have created before with number 2. According to this cross validation, it shows that k = 5 works better than k = 4. Even though I tried the K from 1 to 5, it still shows that 5 works better than other numbers.
+ii) In this case, I can see that logistic regression works better than K-NN. Especially when specificity is higher, logistic regression model has much higher sensitivity. I assume that with this data, logistic regression has higher accuracy than K-NN because the model has 10 explanatory variables which are quite high dimensions. As the number of parameters increases, the number of points that need to have similar accuracy grows exponentially.
+
+```{r,  }
+# Below I use 'train' function from caret library. 
+#Let's look at the list of tunable parameters
+modelLookup("knn") #I can only control K
+
+#Let's set the search grid first
+knnGrid <-  expand.grid(k = seq(100,300, by = 50)) #it will check when both k = 4, 5 and will return the better value
+
+#I will use AUC to choose the best k, hence we need the class probabilities. 
+control <- train_control
+# By fixing the see I can re-generate the results when needed
+set.seed(100)
+
+# 'preProcess': I use this option to center and scale the data
+# 'method' is knn
+# 'metric' is ROC or AUC
+# I already defined the 'trControl' and 'tuneGrid' options above
+
+fit_KNN <- train(default~., data=combined_train,preProcess = c("center", "scale"), #with KNN we always center and Scale
+                 method="knn", metric="ROC", trControl=control,tuneGrid = knnGrid)
+# display results
+print(fit_KNN)
+
+k_nn_probs<-predict(fit_KNN, newdata = combined_test,type = "prob")[,2]
+
+# Let's find the ROC values using 'roc' function from pROC. 
+ROC_knn <- roc(combined_test$default, k_nn_probs)
+# Let's find AUC using the 'auc' function and round it for ease of notation. 
+AUC_knn<-round(ROC_knn$auc*100, digits=2)
+
+```
+
+Compare the out of sample performance of K-NN with logistic regression by plotting the ROC curves for both in the same graph. Use `ggroc` package as I demonstrate in the rmd file from Session 3. 
+
+```{r,   }
+g2 <- ggroc(list("Logistic Regression"=ROC_lr, "K-NN"=ROC_knn))
+g2+ggtitle(paste("AUC Logistic Regression =",AUC_lr,"%"," vs AUC KNN=",AUC_knn,"%",sep="" ))+geom_segment(aes(x = 1, xend = 0, y = 0, yend = 1), color="grey", linetype="dashed")+
+  theme_light()+
+  labs(
+    x = "Specificity",
+    y = "Sensitivity",
+    linetype = "Model Type"
+  )
+
+```
+
+
+
+# Fitting Trees
+
+Fit a tree the function `rpart`. Plot the resulting tree. Compare the results with logistic regression. Finally check the out of sample performance of the model.
+
+i) Based on the tree visualisation, the three variables - grade, term, annual income seems the most important variables to determine the dependent variables. However, when I run varImp function to calculate the overall importance of variables, it gives a bit different results. When using varImp function, it shows that the three most important variables are int_rate, grade, term. This happens because the variable importance calculation is conducted in much more complicated way then the tree splits. The variable importance is measured by the sum of the goodness of split measures for each split for which it was the primary variable + goodness * (adjusted agreement) for all splits in which it was a surrogate. (Source: An introduction to Recursive Partitioning Using the RPART Routines)
+
+ii) Seeing the ROC plots of logistic regression and the tree model, we can see that logistic regression is generally working better than tree model with this dataset. Thus, there is no reason to use tree model over logistic regression in this case.
+
+```{r,   }
+control=rpart.control(cp = 0, maxdepth = 10, minbucket=50, minsplit=2)
+LC_treeModel <- rpart(default~., data=train, method = "class",control =control)
+
+rpart.plot(LC_treeModel)
+
+# Look at the importance using varImp function
+varImp(LC_treeModel)
+```
+
+Find the estimated probabilites in the test data set. Then plot the ROC's and estimated probabilities
+
+```{r,   }
+defprob_trees<-predict(LC_treeModel, newdata = combined_test,type = "prob")[,2]
+
+ROC_tree <- roc(combined_test$default, defprob_trees)
+AUC_tree <- round(ROC_tree$auc*100, digits=2)
+
+#Plot ROC's
+g2 <- ggroc(list("Logistic Regression"=ROC_lr,"Trees"=ROC_tree))
+g2+ggtitle(paste("Logistic Regression=",AUC_lr,"%"," vs Tree=",AUC_tree,"%",sep="" ))+geom_segment(aes(x = 1, xend = 0, y = 0, yend = 1), color="grey", linetype="dashed")
+
+
+#Plot the estimated probabilities for default and non-defaults
+ggplot( combined_test, aes( defprob_trees, color = as.factor(default) ) ) +
+ geom_density( size = 1 ) +
+ ggtitle( "Test Set's Predicted Score" ) +
+ xlab("Estimated Probability")
+
+ggplot( combined_test, aes( defprob_trees, color = as.factor(default) ) ) +
+ stat_ecdf( size = 1 ) +
+ ggtitle( "Test Set's Predicted Score" ) +
+ xlab("Estimated Probability")
+
+#Trees are used when we need to explain our decisions to others who are not data savvy (ex. medical, bank)
+```
+
+
+## Tune parameters of your tree model
+
+Use `caret` package to tune your tree using the complexity parameter `cp`. Check the accuracy of your fitted model.
+
+i) The complexity parameter(cp) in rpart is the minimum improvement in the model needed at each node. Thus, as cp increases the tree becomes more simple. And I decided the best cp by running cross validation to choose which value of cp is the best to decrease the RMSE. By running cross validation I originally got 0.00012 for CP. However, by checking the ROC plot of the rpart model, I could see that between 0.0000 and 0.0002, the ROC is higher. Thus, I reduced the range of the grid to that part and ran again. After that, I got 0.00018 for the cp value and I got 65.38% of ROC from tree model.
+ii) As I fit the higher cp in the rpart training model, the simpler the tree becomes. Also, after certain cp value, the ROC of the model decreases.
+iii) We can add or remove some variables (feature engineering) and control the hyper parameters such as minsplit, minbucket (the minimum number of observations in any terminal node) and many more that leads higher AUC.
+iv) Still the ROC of logistic regression is genuinely higher than that of tree model.
+
+```{r,  }
+#However, expand the search grid below after you run it with basic parameters
+
+modelLookup("rpart") #cp = complexity
+
+#Expand the search grid after you run it with basic parameters
+Grid <- expand.grid(cp = seq(0.0000,0.0002,by=0.00001))
+
+dtree_fit <- train(default~., data=train,
+                   method = "rpart",
+                   metric="ROC",
+                   trControl=train_control,
+                   control=rpart.control(minbucket = 25),
+                   tuneGrid=Grid) 
+
+
+# Plot the best tree model found
+rpart.plot(dtree_fit$finalModel)
+rpart.plot(dtree_fit$finalModel,extra = 1,type=5)
+
+# Print the search results of 'train' function
+plot(dtree_fit)
+print(dtree_fit)
+
+defprob_trees<-predict(dtree_fit, newdata = combined_test,type = "prob")[,2]
+
+ROC_tree <- roc(combined_test$default, defprob_trees)
+AUC_tree<-round(ROC_tree$auc*100, digits=2)
+
+g2 <- ggroc(list("Log Reg"=ROC_lr,"Trees"=ROC_tree))
+g2+ggtitle(paste("Log Reg=",AUC_lr,"%"," vs Tree=",AUC_tree,"%",sep="" ))+geom_segment(aes(x = 1, xend = 0, y = 0, yend = 1), color="grey", linetype="dashed")
+
+#As cp increases, the tree becomes smaller and smaller
+```
+
+Plot the estimated probabilities.
+
+```{r}
+#Plot the estimated probabilities for default and non-defaults
+
+ggplot( combined_test, aes( defprob_trees, color = as.factor(default) ) ) +
+ geom_density( size = 1 ) +
+ ggtitle( "Test Set's Predicted Score" ) +
+ xlab("Estimated Probability")
+
+ggplot( combined_test, aes( defprob_trees, color = as.factor(default) ) ) +
+ stat_ecdf( size = 1 ) +
+ ggtitle( "Test Set's Predicted Score" ) +
+ xlab("Estimated Probability")
+
+```
+
+# Training a Random Forest Model
+
+Fit a random forest (RF) using the `randomForest` function.
+
+From the ROC plot, I observed that the AUC value for Random Forest is much lower than logistic regression. The AUC is almost 10% lower for random forest in this case.
+
+```{r,  }
+#Examine the results it produces
+set.seed(100)
+
+# I will use 'randomForest' library
+library(randomForest)
+
+# 'randomForest' function inherits the parameters of 'rpart' function that control tree growth.
+# Additional parameters are 
+# i) 'ntree': number of trees in the forest
+# ii) 'mtry': number of randomy chosen variables to do a split each time
+# iii) 'importance': is an option to get a sense of the importance of the variables. We will use it below. 
+
+RForest_BBC_Model <- randomForest(default~., data=train, 
+                                    ntree = 200,mtry=3,maxnodes=50,nodesize=2)
+
+# Print the model output                             
+print(RForest_BBC_Model)
+
+
+# Find the predictions in the test data 
+defprob_RF<-predict(RForest_BBC_Model, newdata = combined_test,type = "prob")[,2]
+
+ROC_RF <- roc(combined_test$default, defprob_RF)
+AUC_RF<-round(ROC_RF$auc*100, digits=2)
+
+##PLot the roc's
+g2 <- ggroc(list("Log Reg"=ROC_lr,"Random Forest"=ROC_RF))
+g2+ggtitle(paste("Log Reg=",AUC_lr,"%"," vs RF=",AUC_RF,"%",sep="" ))+geom_segment(aes(x = 1, xend = 0, y = 0, yend = 1), color="grey", linetype="dashed")
+```
+
+Fit a RF and hypertune the number of features the algorithm chooses in each step (variable `mtry`) using the `caret` package and `ranger` method. Choose a few values as otherwise this may take a very long time to run.
+
+i) Firstly, I chose Mtry to be 3 because it is the most close value of the square root of 10 (the number of explanatory variables). And then, I tried different numbers to check which mtry makes the highest accuracy, and I ended up with number 2. When Mtry, which is the number of the variables random forest model randomly chooses to split the branches, is 2, the model works the best.
+
+ii) We can further tune improve the performance of the model by choosing different variables or feature engineering and tuning the hyperparameters of the algorithm (e.g. different split rules). Other than that, we can change the minimum node size as well. By playing around with all the parameters and variables I could get the AUC of 68.51% which is 0.40% higher than logistic regression.
+
+iii) By looking at the variable importance using varImp() function, we can see that 1) interest rate, 2) term 60, 3) gradeD are the most important variables for random forest model to decide the branches and explain the most of the dependent variable.
+
+```{r,  }
+modelLookup("ranger")
+
+# Define the tuning grid: tuneGrid
+gridRF <- data.frame(
+  .mtry = 2,
+  .splitrule = "gini",
+  .min.node.size = c(5:10)
+)
+# Fit random forest: model
+rf_RF <- train(
+  default ~ annual_inc + term + grade + loan_amnt + int_rate, data = train, 
+  method = "ranger",
+  metric = "ROC",
+  trControl = train_control,
+  tuneGrid = gridRF,
+  importance = 'permutation'
+)
+
+
+# Print model to the console
+print(rf_RF)
+names(rf_RF$modelInfo)
+# Let's check the variable importance
+rfImp <- varImp(rf_RF, scale = FALSE)
+plot(rfImp)
+
+```
+
+Examine the predictive performance of the best RF model using the test data set.
+
+```{r,warning=FALSE,  message=FALSE ,  }
+defprob_RF <- predict(rf_RF,combined_test, type = "prob")[,2]
+ROC_forest <- roc(combined_test$default, defprob_RF)
+AUC_forest=round(ROC_forest$auc*100, digits=2)
+
+# Plot the ROC curve
+
+g2 <- ggroc(list("Log Reg"=ROC_lr, "RF"=ROC_forest))
+g2+ggtitle(paste("Log Reg=",AUC_lr,"%"," vs RF=",AUC_forest,"%",sep="" ))+geom_segment(aes(x = 1, xend = 0, y = 0, yend = 1), color="grey", linetype="dashed")
+
+
+##Tip: correlation is not a issue in random forest because it's not related with P-values
+## and the errors are not related to this model
+
+```
+
+Plot the estimated probabilities.
+
+```{r,  }
+#Plot the estimated probabilities for default and non-defaults
+ggplot( combined_test, aes( defprob_RF, color = as.factor(default) ) ) +
+ geom_density( size = 1 ) +
+ ggtitle( "Test Set's Predicted Score" ) +
+ xlab("Estimated Probability")
+
+ggplot( combined_test, aes( defprob_RF, color = as.factor(default) ) ) +
+ stat_ecdf( size = 1 ) +
+ ggtitle( "Test Set's Predicted Score" ) +
+ xlab("Estimated Probability")
+
+```
+
+# Training a GBM
+
+Fit a GBM model using Caret and hypertune its parameters. Check variable importance in this model.
+
+Compared to logistic regression GBM has higher ROC but not as much as Random Forest does. GBM shows 68.46% of AUC and it's 0.35% higher than that of logistic regression.
+
+
+```{r,   } 
+#However, expand the search grid once you run this initial code
+set.seed(100)
+
+ctrl <- train_control
+
+
+
+grid<-expand.grid(interaction.depth = seq(1,5, by = 1),n.trees = seq(100,300, by = 100),shrinkage = seq(0.01,0.03, by =0.01), n.minobsinnode = 10)
+
+gbmFit1 <-  train(
+               default~., data=train, 
+                 method = "gbm", 
+                 trControl = ctrl,
+                   metric = "ROC" ,
+                 preProcess = c("center", "scale"),
+                tuneGrid=grid,
+                verbose=FALSE
+                 )
+summary(gbmFit1)
+print(gbmFit1)
+
+```
+
+
+
+Predict probabilities and plot ROC's
+```{r, }
+watched_prob_GBM <-predict(gbmFit1,combined_test, type = "prob")[,2]
+
+ROC_GBM <- suppressMessages(roc(combined_test$default, watched_prob_GBM))
+AUC_GBM=round(auc(ROC_GBM)*100, digits=2)
+
+ g2 <- ggroc(list("Log Reg"=ROC_lr, "RF"=ROC_forest,"GBM"=ROC_GBM))
+g2+ggtitle(paste("Log Reg=",AUC_lr,"%"," vs RF=",AUC_forest,"%"," vs GBM=",AUC_GBM,"%",sep="" ))+geom_segment(aes(x = 1, xend = 0, y = 0, yend = 1), color="grey", linetype="dashed")
+```
+
+Plot the estimated probabilities.
+
+```{r}
+#Plot the estimated probabilities for default and non-defaults
+ggplot( combined_test, aes( watched_prob_GBM, color = as.factor(default) ) ) +
+ geom_density( size = 1 ) +
+ ggtitle( "Test Set's Predicted Score" ) +
+ xlab("Estimated Probability")
+
+ggplot( combined_test, aes( watched_prob_GBM, color = as.factor(default) ) ) +
+ stat_ecdf( size = 1 ) +
+ ggtitle( "Test Set's Predicted Score" ) +
+ xlab("Estimated Probability")
+
+```
+
+
+
+
+# Ensemble Methods: Stacking
+My correlation table is as below. The correlation between all the models are high except between knn and gbm but still lower than 1. From this correlation table, we can conclude that most of the models will give us similar results excpet knn and gbm, and by using this result of correlation, we can save our time and computational power.
+
+          ranger       gbm       knn       glm
+ranger 1.0000000 0.8584990 0.8908491 0.9395568
+gbm    0.8584990 1.0000000 0.5370328 0.9095530
+knn    0.8908491 0.5370328 1.0000000 0.7581808
+glm    0.9395568 0.9095530 0.7581808 1.0000000
+
+Through Ensemble method, I achieved the highest AUC which is 68.64%. The ROC following the stacking method improves by 0.53% compared to simple logistic regression model. I fed my stacking model with the 4 different classification algorithms: logistic regression, KNN, GBM, Ranger(random forest). Most of the time Ensemble method gives the better result because when the correlation between models is less than 1, the impact of the errors is diminished because part of them cancel between each other. 
+
+
+```{r}
+library(caretEnsemble)
+my_control <- trainControl(
+    method="cv",
+    number=5,
+    savePredictions="final",
+    classProbs=TRUE,
+    summaryFunction=twoClassSummary,
+    verboseIter = TRUE,
+  )
+  
+model_list <- caretList(
+    default~., data=train, 
+    trControl=my_control,
+    metric = "ROC",
+    methodList=c("glm"),
+     preProcess = c("center", "scale"),
+    tuneList=list( ##Change the paramters with the best parameters you found above 
+      ranger=caretModelSpec(method="ranger", tuneGrid=data.frame(mtry=2,splitrule="gini",min.node.size=7)),
+      gbm=caretModelSpec(method="gbm", tuneGrid=data.frame(interaction.depth = 2,n.trees = 300,shrinkage =0.03, n.minobsinnode = 10),verbose=FALSE),
+      knn=caretModelSpec(method="knn", tuneGrid=data.frame(k = 200))#add knn to the code
+               ))
+    
+summary(model_list)  
+
+modelCor(resamples(model_list))
+resamples <- resamples(model_list)
+dotplot(resamples, metric = "ROC")
+```
+  
+  
+Implement stacking and estimate plot the ROC of the resulting model for the test data. 
+
+```{r,warning=FALSE,  message=FALSE}
+#See the instructions at the end
+glm_ensemble <- caretStack(
+    model_list,
+    method="glm",
+    metric="ROC",
+    trControl=trainControl(
+      method="cv",
+      number=2,
+      savePredictions="final",
+      classProbs=TRUE,
+      summaryFunction=twoClassSummary
+    )
+  )
+  #Check the summary of the results
+  summary(glm_ensemble)    
+  
+  
+  #Plot the ROC
+ensemble_prob <- predict(glm_ensemble, combined_test, type = "prob")
+
+ROC_ensemble <- roc(combined_test$default, ensemble_prob)
+AUC_ensemble <- round(ROC_ensemble$auc*100, digits=2)
+AUC_ensemble_text <- paste("Stacking Ensemble AUC=",AUC_ensemble,"%",sep="")
+
+ggroc(list('Logistic'=ROC_lr, 'Stacking Ensemble' = ROC_ensemble)) + theme_gray()+ 
+  geom_segment(aes(x = 1, xend = 0, y = 0, yend = 1), color="grey", linetype="dashed") + 
+  
+  labs (
+  title = 'Lending Club Data',
+  subtitle = paste("LR AUC =",AUC_lr,"% | Stacking Ensemble AUC = ", AUC_ensemble,"%")
+  )
+```
